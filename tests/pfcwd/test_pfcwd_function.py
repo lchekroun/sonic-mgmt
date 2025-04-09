@@ -4,18 +4,23 @@ import os
 import pytest
 import time
 import six
+import re
 
 from tests.common.fixtures.conn_graph_facts import enum_fanout_graph_facts      # noqa F401
 from tests.common.helpers.assertions import pytest_assert, pytest_require
 from tests.common.helpers.pfc_storm import PFCStorm
 from tests.common.plugins.loganalyzer.loganalyzer import LogAnalyzer
-from .files.pfcwd_helper import start_wd_on_ports
-from .files.pfcwd_helper import EXPECT_PFC_WD_DETECT_RE, EXPECT_PFC_WD_RESTORE_RE, fetch_vendor_specific_diagnosis_re
+from tests.common.helpers.pfcwd_helper import start_wd_on_ports
+from tests.common.helpers.pfcwd_helper import EXPECT_PFC_WD_DETECT_RE, EXPECT_PFC_WD_RESTORE_RE, \
+    fetch_vendor_specific_diagnosis_re
+from tests.common.helpers.pfcwd_helper import has_neighbor_device
 from tests.ptf_runner import ptf_runner
 from tests.common import port_toggle
 from tests.common import constants
 from tests.common.dualtor.dual_tor_utils import is_tunnel_qos_remap_enabled, dualtor_ports # noqa F401
 from tests.common.dualtor.mux_simulator_control import toggle_all_simulator_ports_to_enum_rand_one_per_hwsku_frontend_host_m # noqa F401, E501
+from tests.common.helpers.pfcwd_helper import send_background_traffic, check_pfc_storm_state
+from tests.common.utilities import wait_until
 
 
 PTF_PORT_MAPPING_MODE = 'use_orig_interface'
@@ -50,6 +55,15 @@ def stop_pfcwd(duthosts, enum_rand_one_per_hwsku_frontend_hostname):
     duthost = duthosts[enum_rand_one_per_hwsku_frontend_hostname]
     logger.info("--- Stop Pfcwd --")
     duthost.command("pfcwd stop")
+
+
+def is_longlink(dut, profile):
+    if dut.sonichost._facts['platform'] in \
+            ["x86_64-88_lc0_36fh_mo-r0", "x86_64-88_lc0_36fh_m-r0"]:
+        match = re.search("_([0-9]*)m_", profile)
+        if match:
+            return int(match.group(1)) > 2000
+    return False
 
 
 class PfcCmd(object):
@@ -137,7 +151,7 @@ class PfcCmd(object):
             db = "4"
         table_template = BF_PROFILE if db == "4" else BF_PROFILE_TABLE
 
-        if dut.sonichost._facts['platform'] in ["x86_64-88_lc0_36fh_mo-r0", "x86_64-88_lc0_36fh_m-r0"]:
+        if is_longlink(dut, profile):
             asic.run_redis_cmd(
                 argv=[
                     "redis-cli", "-n", db, "HSET", table_template.format(profile), "static_th", static_th
@@ -191,7 +205,7 @@ class PfcCmd(object):
 
         alpha = 0
         static_th = 0
-        if dut.sonichost._facts['platform'] in ["x86_64-88_lc0_36fh_mo-r0", "x86_64-88_lc0_36fh_m-r0"]:
+        if is_longlink(dut, pg_profile):
             static_th = six.text_type(asic.run_redis_cmd(
                 argv=[
                     "redis-cli", "-n", db, "HGET", table_template.format(pg_profile), "static_th"
@@ -216,6 +230,7 @@ class PfcPktCntrs(object):
             action(string): PFCwd action for traffic test
         """
         self.dut = dut
+        self.asic_type = dut.facts['asic_type']
         self.rx_action = rx_action
         self.tx_action = tx_action
         if self.tx_action != "forward":
@@ -253,6 +268,9 @@ class PfcPktCntrs(object):
             begin(bool) : if the counter collection is before or after the test
 
         """
+        if self.asic_type == 'vs':
+            logger.info("Skipping get packet cnt on vs")
+            return
         test_state = ['end', 'begin']
         state = test_state[begin]
         self.cntr_val["tx_{}".format(state)] = int(PfcCmd.counter_cmd(self.dut, queue_oid, self.pkt_cntrs_tx[0]))
@@ -270,6 +288,9 @@ class PfcPktCntrs(object):
             port_type(string) : the type of port (eg. portchannel, vlan, interface)
             pkt_cnt(int) : Number of test packets sent from the PTF
         """
+        if self.asic_type == 'vs':
+            logger.info("Skipping packet cnt check on vs")
+            return
         logger.info("--- Checking Tx {} cntrs ---".format(self.tx_action))
         tx_diff = self.cntr_val["tx_end"] - self.cntr_val["tx_begin"]
         if (port_type in ['vlan', 'interface'] and tx_diff != pkt_cnt) or tx_diff <= 0:
@@ -392,7 +413,7 @@ class SetupPfcwdFunc(object):
         """
         new_alpha = self.alpha
         new_static_th = self.static_th
-        if dut.sonichost._facts['platform'] in ["x86_64-88_lc0_36fh_mo-r0", "x86_64-88_lc0_36fh_m-r0"]:
+        if is_longlink(dut, self.pg_profile):
             if int(self.static_th) > 0:
                 new_static_th = int(int(self.static_th) / 2)
         else:
@@ -421,6 +442,10 @@ class SetupPfcwdFunc(object):
             ptf_port = 'eth%s' % self.pfc_wd['test_port_id']
             if self.pfc_wd['test_port_vlan_id'] is not None:
                 ptf_port += (constants.VLAN_SUB_INTERFACE_SEPARATOR + self.pfc_wd['test_port_vlan_id'])
+            self.ptf.command("ip neigh flush all")
+            self.ptf.command("ip -6 neigh flush all")
+            self.dut.command("ip neigh flush all")
+            self.dut.command("ip -6 neigh flush all")
             self.ptf.command("ifconfig {} {}".format(ptf_port, self.pfc_wd['test_neighbor_addr']))
             self.ptf.command("ping {} -c 10".format(vlan['addr']))
 
@@ -438,15 +463,20 @@ class SetupPfcwdFunc(object):
         """
         # new peer device
         if not self.peer_dev_list or self.peer_device not in self.peer_dev_list:
-            peer_info = {'peerdevice': self.peer_device,
-                         'hwsku': self.fanout_info[self.peer_device]['device_info']['HwSku'],
-                         'pfc_fanout_interface': self.neighbors[self.pfc_wd['test_port']]['peerport']
-                         }
-            self.peer_dev_list[self.peer_device] = peer_info['hwsku']
+            if self.dut.facts['asic_type'] == 'vs':
+                peer_info = {}
+            else:
+                peer_info = {'peerdevice': self.peer_device,
+                             'hwsku': self.fanout_info[self.peer_device]['device_info']['HwSku'],
+                             'pfc_fanout_interface': self.neighbors[self.pfc_wd['test_port']]['peerport']
+                             }
+                self.peer_dev_list[self.peer_device] = peer_info['hwsku']
 
             if self.dut.topo_type == 't2' and self.fanout[self.peer_device].os == 'sonic':
                 gen_file = 'pfc_gen_t2.py'
-                pfc_send_time = 60
+                # We want to set the timer to be high here to keep the storm long enough for manual termination
+                # in the test instead of having it terminated by itself
+                pfc_send_time = 240
             else:
                 gen_file = 'pfc_gen.py'
                 pfc_send_time = None
@@ -484,8 +514,10 @@ class SendVerifyTraffic():
             ptf_params(dict) : all PFC test params specific to the DUT port
         """
         self.ptf = ptf
-        self.router_mac = router_mac
-        self.tx_mac = tx_mac
+        self.tx_mac = router_mac
+        self.src_port_mac = router_mac
+        self.router_mac = tx_mac
+        self.dst_port_mac = tx_mac
         self.pfc_queue_index = pfc_params['queue_index']
         self.pfc_wd_test_pkt_count = pfc_params['test_pkt_count']
         self.pfc_wd_rx_port_id = pfc_params['rx_port_id']
@@ -498,6 +530,7 @@ class SendVerifyTraffic():
         self.pfc_wd_rx_port_vlan_id = pfc_params['rx_port_vlan_id']
         self.port_id_to_type_map = pfc_params['port_id_to_type_map']
         self.port_type = pfc_params['port_type']
+        self.is_dualtor = is_dualtor
         if is_dualtor:
             self.vlan_mac = "00:aa:bb:cc:dd:ee"
         else:
@@ -531,7 +564,7 @@ class SendVerifyTraffic():
         if self.pfc_wd_test_port_vlan_id is not None:
             ptf_params['port_dst_vlan_id'] = self.pfc_wd_test_port_vlan_id
         log_format = datetime.datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
-        log_file = "/tmp/pfc_wd.PfcWdTest.{}.log".format(log_format)
+        log_file = "/tmp/1.pfc_wd.PfcWdTest.{}.log".format(log_format)
         ptf_runner(self.ptf, "ptftests", "pfc_wd.PfcWdTest", "ptftests", params=ptf_params,
                    log_file=log_file, is_python3=True)
 
@@ -548,8 +581,8 @@ class SendVerifyTraffic():
             dst_port = "".join(str(self.pfc_wd_rx_port_id)).replace(',', '')
         else:
             dst_port = "[ " + str(self.pfc_wd_rx_port_id) + " ]"
-        ptf_params = {'router_mac': self.tx_mac,
-                      'vlan_mac': self.tx_mac,
+        ptf_params = {'router_mac': self.dst_port_mac,
+                      'vlan_mac': self.vlan_mac if self.is_dualtor else self.dst_port_mac,
                       'queue_index': self.pfc_queue_index,
                       'pkt_count': self.pfc_wd_test_pkt_count,
                       'port_src': self.pfc_wd_test_port_id,
@@ -562,7 +595,7 @@ class SendVerifyTraffic():
         if self.pfc_wd_test_port_vlan_id is not None:
             ptf_params['port_src_vlan_id'] = self.pfc_wd_test_port_vlan_id
         log_format = datetime.datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
-        log_file = "/tmp/pfc_wd.PfcWdTest.{}.log".format(log_format)
+        log_file = "/tmp/2.pfc_wd.PfcWdTest.{}.log".format(log_format)
         ptf_runner(self.ptf, "ptftests", "pfc_wd.PfcWdTest", "ptftests", params=ptf_params,
                    log_file=log_file, is_python3=True)
 
@@ -582,7 +615,7 @@ class SendVerifyTraffic():
             other_queue = self.pfc_queue_index + 1
 
         ptf_params = {'router_mac': self.router_mac,
-                      'vlan_mac': self.vlan_mac,
+                      'vlan_mac': self.src_port_mac,
                       'queue_index': other_queue,
                       'pkt_count': self.pfc_wd_test_pkt_count,
                       'port_src': self.pfc_wd_rx_port_id[0],
@@ -595,7 +628,7 @@ class SendVerifyTraffic():
         if self.pfc_wd_test_port_vlan_id is not None:
             ptf_params['port_dst_vlan_id'] = self.pfc_wd_test_port_vlan_id
         log_format = datetime.datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
-        log_file = "/tmp/pfc_wd.PfcWdTest.{}.log".format(log_format)
+        log_file = "/tmp/3.pfc_wd.PfcWdTest.{}.log".format(log_format)
         ptf_runner(self.ptf, "ptftests", "pfc_wd.PfcWdTest", "ptftests", params=ptf_params,
                    log_file=log_file, is_python3=True)
 
@@ -615,7 +648,7 @@ class SendVerifyTraffic():
             other_pg = self.pfc_queue_index + 1
 
         ptf_params = {'router_mac': self.tx_mac,
-                      'vlan_mac': self.tx_mac,
+                      'vlan_mac': self.vlan_mac if self.is_dualtor else self.dst_port_mac,
                       'queue_index': other_pg,
                       'pkt_count': self.pfc_wd_test_pkt_count,
                       'port_src': self.pfc_wd_test_port_id,
@@ -628,7 +661,7 @@ class SendVerifyTraffic():
         if self.pfc_wd_test_port_vlan_id is not None:
             ptf_params['port_src_vlan_id'] = self.pfc_wd_test_port_vlan_id
         log_format = datetime.datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
-        log_file = "/tmp/pfc_wd.PfcWdTest.{}.log".format(log_format)
+        log_file = "/tmp/4.pfc_wd.PfcWdTest.{}.log".format(log_format)
         ptf_runner(self.ptf, "ptftests", "pfc_wd.PfcWdTest", "ptftests", params=ptf_params,
                    log_file=log_file, is_python3=True)
 
@@ -638,7 +671,7 @@ class SendVerifyTraffic():
         """
         logger.info("Send packets to {} to fill up the buffer".format(self.pfc_wd_test_port))
         ptf_params = {'router_mac': self.router_mac,
-                      'vlan_mac': self.vlan_mac,
+                      'vlan_mac': self.src_port_mac,
                       'queue_index': self.pfc_queue_index,
                       'pkt_count': self.pfc_wd_test_pkt_count,
                       'port_src': self.pfc_wd_rx_port_id[0],
@@ -651,7 +684,7 @@ class SendVerifyTraffic():
         if self.pfc_wd_test_port_vlan_id is not None:
             ptf_params['port_dst_vlan_id'] = self.pfc_wd_test_port_vlan_id
         log_format = datetime.datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
-        log_file = "/tmp/pfc_wd.PfcWdTest.{}.log".format(log_format)
+        log_file = "/tmp/5.pfc_wd.PfcWdTest.{}.log".format(log_format)
         ptf_runner(self.ptf, "ptftests", "pfc_wd.PfcWdTest", "ptftests", params=ptf_params,
                    log_file=log_file, is_python3=True)
 
@@ -697,26 +730,45 @@ class TestPfcwdFunc(SetupPfcwdFunc):
         loganalyzer.expect_regex.extend([EXPECT_PFC_WD_DETECT_RE + fetch_vendor_specific_diagnosis_re(dut)])
         loganalyzer.match_regex = []
 
-        if action != "dontcare":
-            start_wd_on_ports(dut, port, restore_time, detect_time, action)
+        selected_test_ports = [self.pfc_wd['rx_port'][0]]
+        test_ports_info = {self.pfc_wd['rx_port'][0]: self.pfc_wd}
+        queues = [self.storm_hndle.pfc_queue_idx]
 
-        if not self.pfc_wd['fake_storm']:
-            self.storm_hndle.start_storm()
+        extra_pfc_storm_timeout_needed = dut.facts['asic_type'] in ["mellanox", "cisco-8000"]
+        if extra_pfc_storm_timeout_needed:
+            PFC_STORM_TIMEOUT = 30
+            pfcwd_stats_before_test = check_pfc_storm_state(dut, port, self.storm_hndle.pfc_queue_idx)
 
-        if action == "dontcare":
-            self.traffic_inst.fill_buffer()
-            start_wd_on_ports(dut, port, restore_time, detect_time, "drop")
+        with send_background_traffic(dut, self.ptf, queues, selected_test_ports, test_ports_info):
+            if action != "dontcare":
+                start_wd_on_ports(dut, port, restore_time, detect_time, action)
 
-        # placing this here to cover all action types. for 'dontcare' action,
-        # wd is started much later after the pfc storm is started
-        if self.pfc_wd['fake_storm']:
-            PfcCmd.set_storm_status(dut, self.queue_oid, "enabled")
+            if not self.pfc_wd['fake_storm']:
+                self.storm_hndle.start_storm()
 
-        time.sleep(5)
+            if action == "dontcare":
+                self.traffic_inst.fill_buffer()
+                start_wd_on_ports(dut, port, restore_time, detect_time, "drop")
+
+            # placing this here to cover all action types. for 'dontcare' action,
+            # wd is started much later after the pfc storm is started
+            if self.pfc_wd['fake_storm']:
+                PfcCmd.set_storm_status(dut, self.queue_oid, "enabled")
+
+            if extra_pfc_storm_timeout_needed:
+                # On Mellanox and Cisco platform, more time is required for PFC storm being triggered
+                # as PFC pause sent from Non-Mellanox leaf fanout is not continuous sometimes.
+                pytest_assert(wait_until(PFC_STORM_TIMEOUT, 2, 0,
+                                        lambda: check_pfc_storm_state(dut, port, self.storm_hndle.pfc_queue_idx) != pfcwd_stats_before_test),  # noqa: E501, E128
+                                        "PFC storm state did not change as expected")  # noqa: E127
+            else:
+                time.sleep(5)
 
         # storm detect
         logger.info("Verify if PFC storm is detected on port {}".format(port))
-        loganalyzer.analyze(marker)
+        if dut.facts['asic_type'] != 'vs':
+            loganalyzer.analyze(marker)
+
         self.stats.get_pkt_cnts(self.queue_oid, begin=True)
         # test pfcwd functionality on a storm
         self.traffic_inst.verify_wd_func(action, self.rx_action, self.tx_action)
@@ -746,7 +798,8 @@ class TestPfcwdFunc(SetupPfcwdFunc):
         time.sleep(self.timers['pfc_wd_wait_for_restore_time'])
         # storm restore
         logger.info("Verify if PFC storm is restored on port {}".format(port))
-        loganalyzer.analyze(marker)
+        if dut.facts['asic_type'] != 'vs':
+            loganalyzer.analyze(marker)
         self.stats.get_pkt_cnts(self.queue_oid, begin=False)
 
     def run_test(self, dut, port, action, mmu_action=None, detect=True, restore=True):
@@ -774,9 +827,41 @@ class TestPfcwdFunc(SetupPfcwdFunc):
             logger.info("--- Verify PFCwd counters for port {} ---".format(port))
             self.stats.verify_pkt_cnts(self.pfc_wd['port_type'], self.pfc_wd['test_pkt_count'])
 
+    def run_no_traffic_test(self, dut, port):
+        """
+        No Storm detection with no traffic.
+
+        Args:
+            dut(AnsibleHost) : DUT instance
+            port(string) : DUT port
+
+        Returns:
+            loganalyzer(Loganalyzer) : instance
+        """
+
+        loganalyzer = LogAnalyzer(ansible_host=self.dut,
+                                  marker_prefix="pfc_function_no_storm_detect_port_{}".format(port))
+        marker = loganalyzer.init()
+        ignore_file = os.path.join(TEMPLATES_DIR, "ignore_pfc_wd_messages")
+        reg_exp = loganalyzer.parse_regexp_file(src=ignore_file)
+        loganalyzer.ignore_regex.extend(reg_exp)
+        loganalyzer.expect_regex = []
+        loganalyzer.match_regex = []
+        loganalyzer.match_regex.extend([EXPECT_PFC_WD_DETECT_RE + fetch_vendor_specific_diagnosis_re(dut)])
+
+        restore_time = self.timers['pfc_wd_restore_time_large']
+        detect_time = self.timers['pfc_wd_detect_time']
+        start_wd_on_ports(dut, port, restore_time, detect_time, "drop")
+        self.storm_hndle.start_storm()
+
+        logger.info("Verify if PFC storm is not detected on port {}".format(port))
+        if dut.facts['asic_type'] != 'vs':
+            loganalyzer.analyze(marker)
+        return loganalyzer
+
     def set_traffic_action(self, duthost, action):
         action = action if action != "dontcare" else "drop"
-        if duthost.facts["asic_type"] in ["mellanox", "cisco-8000"] or is_tunnel_qos_remap_enabled(duthost):
+        if duthost.facts["asic_type"] in ["mellanox", "cisco-8000", "innovium"] or is_tunnel_qos_remap_enabled(duthost):
             self.rx_action = "forward"
         else:
             self.rx_action = action
@@ -784,7 +869,9 @@ class TestPfcwdFunc(SetupPfcwdFunc):
 
     def test_pfcwd_actions(self, request, fake_storm, setup_pfc_test, setup_dut_test_params, enum_fanout_graph_facts,  # noqa F811
                            ptfhost, duthosts, enum_rand_one_per_hwsku_frontend_hostname, fanouthosts,
-                           pause_icmp_responder, toggle_all_simulator_ports_to_enum_rand_one_per_hwsku_frontend_host_m): # noqa F811
+                           setup_standby_ports_on_non_enum_rand_one_per_hwsku_frontend_host_m_unconditionally,         # noqa F811
+                           toggle_all_simulator_ports_to_enum_rand_one_per_hwsku_frontend_host_m,                      # noqa F811
+                           set_pfc_time_cisco_8000): # noqa F811
         """
         PFCwd functional test
 
@@ -807,6 +894,9 @@ class TestPfcwdFunc(SetupPfcwdFunc):
         self.timers = setup_info['pfc_timers']
         self.ports = setup_info['selected_test_ports']
         self.test_ports_info = setup_info['test_ports']
+        if self.dut.topo_type == 't2':
+            key, value = list(self.ports.items())[0]
+            self.ports = {key: value}
         self.neighbors = setup_info['neighbors']
         self.peer_dev_list = dict()
         self.fake_storm = fake_storm
@@ -814,6 +904,12 @@ class TestPfcwdFunc(SetupPfcwdFunc):
         self.rx_action = None
         self.tx_action = None
         self.is_dualtor = setup_dut_info['basicParams']['is_dualtor']
+
+        # skip the pytest when the device does not have neighbors
+        # 'rx_port' being None indicates there are no ports available to receive frames for pfc storm
+        if not has_neighbor_device(setup_pfc_test):
+            pytest.skip("Test skipped: No neighbors detected as 'rx_port' is None for selected test ports,"
+                        " which is necessary for PFCwd test setup.")
 
         for idx, port in enumerate(self.ports):
             logger.info("")
@@ -839,8 +935,6 @@ class TestPfcwdFunc(SetupPfcwdFunc):
                     logger.info("{} on port {}: Tx traffic action {}, Rx traffic action {} ".
                                 format(WD_ACTION_MSG_PFX[action], port, self.tx_action, self.rx_action))
                     self.run_test(self.dut, port, action)
-                except Exception as e:
-                    pytest.fail(str(e))
 
                 finally:
                     if self.storm_hndle:
@@ -854,7 +948,9 @@ class TestPfcwdFunc(SetupPfcwdFunc):
 
     def test_pfcwd_multi_port(self, request, fake_storm, setup_pfc_test, setup_dut_test_params, enum_fanout_graph_facts,  # noqa F811
                               ptfhost, duthosts, enum_rand_one_per_hwsku_frontend_hostname, fanouthosts,
-                              pause_icmp_responder, toggle_all_simulator_ports_to_enum_rand_one_per_hwsku_frontend_host_m): # noqa F811
+                              setup_standby_ports_on_non_enum_rand_one_per_hwsku_frontend_host_m_unconditionally,         # noqa F811
+                              toggle_all_simulator_ports_to_enum_rand_one_per_hwsku_frontend_host_m,                      # noqa F811
+                              set_pfc_time_cisco_8000): # noqa F811
         """
         Tests pfcwd behavior when 2 ports are under pfc storm one after the other
 
@@ -903,6 +999,12 @@ class TestPfcwdFunc(SetupPfcwdFunc):
         self.set_traffic_action(duthost, "drop")
         self.stats = PfcPktCntrs(self.dut, self.rx_action, self.tx_action)
 
+        # skip the pytest when the device does not have neighbors
+        # 'rx_port' being None indicates there are no ports available to receive frames for pfc storm
+        if not has_neighbor_device(setup_pfc_test):
+            pytest.skip("Test skipped: No neighbors detected as 'rx_port' is None for selected test ports,"
+                        " which is necessary for PFCwd test setup.")
+
         for count in range(2):
             try:
                 for idx, port in enumerate(selected_ports):
@@ -922,16 +1024,15 @@ class TestPfcwdFunc(SetupPfcwdFunc):
                     self.setup_test_params(port, setup_info['vlan'], init=not idx, detect=False, toggle=idx and count)
                     self.run_test(self.dut, port, "drop", detect=False)
 
-            except Exception as e:
-                pytest.fail(str(e))
-
             finally:
                 logger.info("--- Stop PFC WD ---")
                 self.dut.command("pfcwd stop")
 
     def test_pfcwd_mmu_change(self, request, fake_storm, setup_pfc_test, setup_dut_test_params, enum_fanout_graph_facts,   # noqa F811
                               ptfhost, duthosts, enum_rand_one_per_hwsku_frontend_hostname, fanouthosts, dualtor_ports, # noqa F811
-                              pause_icmp_responder, toggle_all_simulator_ports_to_enum_rand_one_per_hwsku_frontend_host_m): # noqa F811
+                              setup_standby_ports_on_non_enum_rand_one_per_hwsku_frontend_host_m_unconditionally,       # noqa F811
+                              toggle_all_simulator_ports_to_enum_rand_one_per_hwsku_frontend_host_m,                      # noqa F811
+                              set_pfc_time_cisco_8000): # noqa F811
         """
         Tests if mmu changes impact Pfcwd functionality
 
@@ -984,6 +1085,12 @@ class TestPfcwdFunc(SetupPfcwdFunc):
         self.set_traffic_action(duthost, "drop")
         self.stats = PfcPktCntrs(self.dut, self.rx_action, self.tx_action)
 
+        # skip the pytest when the device does not have neighbors
+        # 'rx_port' being None indicates there are no ports available to receive frames for pfc storm
+        if not has_neighbor_device(setup_pfc_test):
+            pytest.skip("Test skipped: No neighbors detected as 'rx_port' is None for selected test ports,"
+                        " which is necessary for PFCwd test setup.")
+
         try:
             for idx, mmu_action in enumerate(MMU_ACTIONS):
                 self.traffic_inst = SendVerifyTraffic(
@@ -1007,9 +1114,6 @@ class TestPfcwdFunc(SetupPfcwdFunc):
                 self.run_test(self.dut, port, "drop", mmu_action=mmu_action)
                 self.dut.command("pfcwd stop")
 
-        except Exception as e:
-            pytest.fail(str(e))
-
         finally:
             if self.storm_hndle:
                 logger.info("--- Stop pfc storm on port {}".format(port))
@@ -1021,7 +1125,9 @@ class TestPfcwdFunc(SetupPfcwdFunc):
 
     def test_pfcwd_port_toggle(self, request, fake_storm, setup_pfc_test, setup_dut_test_params, enum_fanout_graph_facts,  # noqa F811
                                tbinfo, ptfhost, duthosts, enum_rand_one_per_hwsku_frontend_hostname, fanouthosts,
-                               pause_icmp_responder, toggle_all_simulator_ports_to_enum_rand_one_per_hwsku_frontend_host_m): # noqa F811
+                               setup_standby_ports_on_non_enum_rand_one_per_hwsku_frontend_host_m_unconditionally,         # noqa F811
+                               toggle_all_simulator_ports_to_enum_rand_one_per_hwsku_frontend_host_m,                      # noqa F811
+                               set_pfc_time_cisco_8000): # noqa F811
         """
         Test PfCWD functionality after toggling port
 
@@ -1055,6 +1161,9 @@ class TestPfcwdFunc(SetupPfcwdFunc):
         self.timers = setup_info['pfc_timers']
         self.ports = setup_info['selected_test_ports']
         self.test_ports_info = setup_info['test_ports']
+        if self.dut.topo_type == 't2':
+            key, value = list(self.ports.items())[0]
+            self.ports = {key: value}
         self.neighbors = setup_info['neighbors']
         self.peer_dev_list = dict()
         self.fake_storm = fake_storm
@@ -1063,6 +1172,12 @@ class TestPfcwdFunc(SetupPfcwdFunc):
         self.tx_action = None
         self.is_dualtor = setup_dut_info['basicParams']['is_dualtor']
         action = "dontcare"
+
+        # skip the pytest when the device does not have neighbors
+        # 'rx_port' being None indicates there are no ports available to receive frames for pfc storm
+        if not has_neighbor_device(setup_pfc_test):
+            pytest.skip("Test skipped: No neighbors detected as 'rx_port' is None for selected test ports,"
+                        " which is necessary for PFCwd test setup.")
 
         for idx, port in enumerate(self.ports):
             logger.info("")
@@ -1105,9 +1220,6 @@ class TestPfcwdFunc(SetupPfcwdFunc):
                 if result["total"]["expected_missing_match"] == 0:
                     pytest.fail(result)
 
-            except Exception as e:
-                pytest.fail(str(e))
-
             finally:
                 if self.storm_hndle:
                     logger.info("--- Stop PFC storm on port {}".format(port))
@@ -1116,4 +1228,62 @@ class TestPfcwdFunc(SetupPfcwdFunc):
                     logger.info("--- Disabling fake storm on port {} queue {}".format(port, self.queue_oid))
                     PfcCmd.set_storm_status(self.dut, self.queue_oid, "disabled")
                 logger.info("--- Stop PFCWD ---")
+                self.dut.command("pfcwd stop")
+
+    def test_pfcwd_no_traffic(
+            self, request, setup_pfc_test, setup_dut_test_params, enum_fanout_graph_facts,  # noqa F811
+            ptfhost, duthosts, enum_rand_one_per_hwsku_frontend_hostname, fanouthosts,
+            set_pfc_time_cisco_8000): # noqa F811
+        """
+        Verify the pfcwd is not triggered when no traffic is sent, even when pfc storm is active.
+        Args:
+            request(object) : pytest request object
+            setup_pfc_test(fixture) : Module scoped autouse fixture for PFCwd
+            enum_fanout_graph_facts(fixture) : fanout graph info
+            ptfhost(AnsibleHost) : ptf host instance
+            duthost(AnsibleHost) : DUT instance
+            fanouthosts(AnsibleHost): fanout instance
+        """
+        duthost = duthosts[enum_rand_one_per_hwsku_frontend_hostname]
+        setup_info = setup_pfc_test
+        setup_dut_info = setup_dut_test_params
+        self.fanout_info = enum_fanout_graph_facts
+        self.ptf = ptfhost
+        self.dut = duthost
+        self.fanout = fanouthosts
+        self.timers = setup_info['pfc_timers']
+        self.ports = setup_info['selected_test_ports']
+        self.test_ports_info = setup_info['test_ports']
+        if self.dut.topo_type == 't2':
+            key, value = list(self.ports.items())[0]
+            self.ports = {key: value}
+        self.neighbors = setup_info['neighbors']
+        self.peer_dev_list = dict()
+        self.storm_hndle = None
+        self.rx_action = None
+        self.tx_action = None
+        self.is_dualtor = setup_dut_info['basicParams']['is_dualtor']
+        self.fake_storm = False  # Not needed for this test.
+
+        # skip the pytest when the device does not have neighbors
+        # 'rx_port' being None indicates there are no ports available to receive frames for pfc storm
+        if not has_neighbor_device(setup_pfc_test):
+            pytest.skip("Test skipped: No neighbors detected as 'rx_port' is None for selected test ports,"
+                        " which is necessary for PFCwd test setup.")
+
+        for idx, port in enumerate(self.ports):
+            logger.info("")
+            logger.info("--- Testing non-Trafific Pfcwd actions on {} ---".format(port))
+            self.setup_test_params(port, setup_info['vlan'], init=not idx)
+
+            pfc_wd_restore_time_large = request.config.getoption("--restore-time")
+            # wait time before we check the logs for the 'restore' signature. 'pfc_wd_restore_time_large' is in ms.
+            self.timers['pfc_wd_wait_for_restore_time'] = int(pfc_wd_restore_time_large / 1000 * 2)
+            try:
+                self.run_no_traffic_test(self.dut, port)
+            finally:
+                if self.storm_hndle:
+                    logger.info("--- Stop pfc storm on port {}".format(port))
+                    self.storm_hndle.stop_storm()
+                logger.info("--- Stop PFC WD ---")
                 self.dut.command("pfcwd stop")

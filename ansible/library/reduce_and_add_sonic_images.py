@@ -2,7 +2,7 @@
 
 import logging
 import sys
-from datetime import datetime
+import time
 from os import path
 from ansible.module_utils.basic import AnsibleModule
 from ansible.module_utils.debug_utils import config_module_logging
@@ -37,7 +37,8 @@ results = {"downloaded_image_version": "Unknown", "current_stage": "Unknown", "m
 def log(msg):
     global results
 
-    timestamp = datetime.utcnow()
+    current_time = time.time()
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(current_time))
     results["messages"].append("{} {}".format(str(timestamp), msg))
     logging.debug(msg)
 
@@ -110,21 +111,35 @@ def setup_swap_if_necessary(module):
 def reduce_installed_sonic_images(module):
     log("reduce_installed_sonic_images")
 
-    _, out, _ = exec_command(module, cmd="sonic_installer list", ignore_error=True)
+    rc, out, _ = exec_command(module, cmd="sonic_installer list", ignore_error=True)
+    if rc != 0:
+        log("Failed to get sonic image list. Will try to install new image anyway.")
+        return
+
     lines = out.split('\n')
 
-    # if next boot image not same with current, set current as next boot, and delete the orinal next image
+    # if next boot image not same with current, set current as next boot, and delete the original next image
+    curr_image = ""
+    next_image = ""
     for line in lines:
         if 'Current:' in line:
             curr_image = line.split(':')[1].strip()
         elif 'Next:' in line:
             next_image = line.split(':')[1].strip()
 
+    if curr_image == "":
+        log("Failed to get current image. Will try to install new image anyway.")
+        return
+
+    if next_image == "":
+        log("Failed to get next image. Will try to install new image anyway.")
+        return
+
     if curr_image != next_image:
         log("set-next-boot")
         exec_command(module, cmd="sonic_installer set-next-boot {}".format(curr_image), ignore_error=True)
 
-    log("clearnup old image")
+    log("cleanup old image")
     exec_command(module, cmd="sonic_installer cleanup -y", ignore_error=True)
 
     log("Done reduce_installed_sonic_images")
@@ -161,20 +176,88 @@ def download_new_sonic_image(module, new_image_url, save_as):
         _, out, _ = exec_command(module, cmd="sonic_installer binary_version {}".format(save_as))
         results["downloaded_image_version"] = out.rstrip('\n')
         log("Downloaded image version: {}".format(results["downloaded_image_version"]))
+        # Save the binary version to file
+        exec_command(module, cmd="sudo echo {} > /tmp/downloaded-sonic-image-version".format(
+            results["downloaded_image_version"]))
+
+        # get image size
+        try:
+            _, out, _ = exec_command(module, cmd="ls -al {}".format(save_as), msg="get new image size")
+            lines = out.split('\n')
+            for line in lines:
+                if save_as in line:
+                    fields = line.split()
+                    if len(fields) < 3:
+                        return
+                    else:
+                        image_size = int(fields[4])
+                        results['image_size'] = image_size
+                        log("image size: {}".format(image_size))
+                        break
+        except Exception as e:
+            log("Failed to get image file size: {}".format(e))
+
+
+def get_sonic_image_size(module):
+    global results
+
+    if "Unknown" == results["downloaded_image_version"]:
+        return
+
+    image_path = "/host/image-{}".format(results["downloaded_image_version"].split("SONiC-OS-")[1])
+    log("image_path: {}".format(image_path))
+    squashfs_file_name = "fs.squashfs"
+    docker_file_name = "dockerfs.tar.gz"
+
+    # get docker and squashfs file size
+    _, out, _ = exec_command(module, cmd="ls -al {}".format(image_path), msg="ls image_dir")
+    lines = out.split('\n')
+    for line in lines:
+        if docker_file_name in line:
+            fields = line.split()
+            if len(fields) < 3:
+                return
+            else:
+                docker_file_size = int(fields[4])
+                results['dockerfs'] = docker_file_size
+                log("dockerfs size: {}".format(docker_file_size))
+        elif squashfs_file_name in line:
+            fields = line.split()
+            if len(fields) < 3:
+                return
+            else:
+                squashfs_file_size = int(fields[4])
+                results['squashfs'] = squashfs_file_size
+                log("squashfs size: {}".format(squashfs_file_size))
+
+    # get docker folder size
+    docker_dir = image_path + "/docker"
+    if path.exists(docker_dir):
+        log("docker_dir: {}".format(docker_dir))
+        _, out, _ = exec_command(module, cmd="sudo du -sb {}".format(docker_dir), msg="get docker_dir")
+        lines = out.split('\n')
+        for line in lines:
+            if docker_dir in line:
+                fields = line.split()
+                if len(fields) < 2:
+                    return
+                else:
+                    docker_dir_size = int(fields[0])
+                    results['docker_dir'] = docker_dir_size
+                    log("docker dir size: {}".format(docker_dir_size))
+                    break
 
 
 def install_new_sonic_image(module, new_image_url, save_as=None, required_space=1600):
     log("install new sonic image")
-
-    log("Clean-up previous downloads first")
-    exec_command(
-        module,
-        cmd="rm -f {}".format("/host/downloaded-sonic-image"),
-        msg="clean up previously downloaded image",
-        ignore_error=True
-    )
-
     if not save_as:
+        log("Clean-up previous downloads first")
+        exec_command(
+            module,
+            cmd="rm -f {}".format("/host/downloaded-sonic-image"),
+            msg="clean up previously downloaded image",
+            ignore_error=True
+        )
         avail = get_disk_free_size(module, "/host")
         save_as = "/host/downloaded-sonic-image" if avail >= 2000 else "/tmp/tmpfs/downloaded-sonic-image"
 
@@ -192,6 +275,11 @@ def install_new_sonic_image(module, new_image_url, save_as=None, required_space=
         )
         return
 
+    skip_package_migrate_param = ""
+    _, output, _ = exec_command(module, cmd="sonic_installer install --help", ignore_error=True)
+    if "skip-package-migration" in output:
+        skip_package_migrate_param = "--skip-package-migration"
+
     if save_as.startswith("/tmp/tmpfs"):
         log("Create a tmpfs partition to download image to install")
         exec_command(module, cmd="mkdir -p /tmp/tmpfs", ignore_error=True)
@@ -206,7 +294,7 @@ def install_new_sonic_image(module, new_image_url, save_as=None, required_space=
         log("Running sonic_installer to install image at {}".format(save_as))
         rc, out, err = exec_command(
             module,
-            cmd="sonic_installer install {} -y".format(save_as),
+            cmd="sonic_installer install {} {} -y".format(save_as, skip_package_migrate_param),
             msg="installing new image", ignore_error=True
         )
         log("Done running sonic_installer to install image")
@@ -225,8 +313,8 @@ def install_new_sonic_image(module, new_image_url, save_as=None, required_space=
         log("Running sonic_installer to install image at {}".format(save_as))
         rc, out, err = exec_command(
             module,
-            cmd="sonic_installer install {} -y".format(
-                save_as),
+            cmd="sonic_installer install {} {} -y".format(
+                save_as, skip_package_migrate_param),
             msg="installing new image", ignore_error=True
         )
         log("Always remove the downloaded temp image inside /host/ before proceeding")
@@ -243,6 +331,11 @@ def install_new_sonic_image(module, new_image_url, save_as=None, required_space=
             cmd="rm -f /host/old_config/config_db.json",
             msg="Remove config_db.json in preference of minigraph.xml"
         )
+
+    try:
+        get_sonic_image_size(module)
+    except Exception as e:
+        log("Failed to get image size: {}".format(e))
 
 
 def work_around_for_slow_disks(module):
@@ -375,10 +468,7 @@ def main():
     required_space = module.params['required_space']
 
     try:
-        if not new_image_url:
-            reduce_installed_sonic_images(module)
-            free_up_disk_space(module, disk_used_pcent)
-        else:
+        if new_image_url or save_as:
             results["current_stage"] = "start"
 
             work_around_for_reboot(module)
@@ -393,6 +483,9 @@ def main():
 
             install_new_sonic_image(module, new_image_url, save_as, required_space)
             results["current_stage"] = "complete"
+        else:
+            reduce_installed_sonic_images(module)
+            free_up_disk_space(module, disk_used_pcent)
     except Exception:
         err = str(sys.exc_info())
         module.fail_json(msg="Exception raised during image upgrade", results=results, err=err)

@@ -56,13 +56,15 @@ def get_fdb_dict(ptfadapter, vlan_table, dummay_mac_count):
     return fdb
 
 
-def test_fdb_mac_move(ptfadapter, duthosts, rand_one_dut_hostname, ptfhost, get_function_conpleteness_level):
-    # Perform FDB clean up before each test
-    fdb_cleanup(duthosts, rand_one_dut_hostname)
+def test_fdb_mac_move(ptfadapter, duthosts, fanouthosts, rand_one_dut_hostname, ptfhost,
+                      get_function_completeness_level, rotate_syslog):
 
-    normalized_level = get_function_conpleteness_level
+    # Perform FDB clean up before each test
+    fdb_cleanup(duthosts, rand_one_dut_hostname, fanouthosts)
+
+    normalized_level = get_function_completeness_level
     if normalized_level is None:
-        normalized_level = "basic"
+        normalized_level = "debug"
     loop_times = LOOP_TIMES_LEVEL_MAP[normalized_level]
 
     duthost = duthosts[rand_one_dut_hostname]
@@ -133,6 +135,7 @@ def test_fdb_mac_move(ptfadapter, duthosts, rand_one_dut_hostname, ptfhost, get_
                       "FDB Table Add failed")
         # Flush dataplane
         ptfadapter.dataplane.flush()
-        fdb_cleanup(duthosts, rand_one_dut_hostname)
+        time.sleep(10)
+        fdb_cleanup(duthosts, rand_one_dut_hostname, fanouthosts)
         # Wait for 10 seconds before starting next loop
         time.sleep(10)
